@@ -1,144 +1,176 @@
 #!/bin/bash
+set -euo pipefail
 
-# readlink -f cannot work on mac
 TOPDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-BUILD_SH=$TOPDIR/build.sh
-
-CMAKE_COMMAND="cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 --log-level=STATUS"
+# cmake binary (do NOT bake configure-only flags into it)
+CMAKE_BIN="cmake"
+# configure flags only
+CMAKE_CONFIGURE="${CMAKE_BIN} -DCMAKE_EXPORT_COMPILE_COMMANDS=1 --log-level=STATUS"
 
 ALL_ARGS=("$@")
 BUILD_ARGS=()
 MAKE_ARGS=(-j 4)
 
-echo "$0 ${ALL_ARGS[@]}"
+echo "$0 ${ALL_ARGS[*]}"
+
+# Install 3rd deps into project-local directory (avoid /usr/local permission issues)
+DEPS_PREFIX="${TOPDIR}/deps/install"
+mkdir -p "${DEPS_PREFIX}"
 
 function usage
 {
   echo "Usage:"
   echo "./build.sh -h"
-  echo "./build.sh init # install dependence"
+  echo "./build.sh init # build & install dependencies into deps/install"
   echo "./build.sh clean"
   echo "./build.sh [BuildType] [--make [MakeOptions]]"
   echo ""
   echo "OPTIONS:"
   echo "BuildType => debug(default), release"
   echo "MakeOptions => Options to make command, default: -j N"
-
   echo ""
   echo "Examples:"
-  echo "# Init."
   echo "./build.sh init"
-  echo ""
-  echo "# Build： by debug mode and make with -j4."
   echo "./build.sh debug --make -j4"
 }
 
 function parse_args
 {
-  make_start=false
+  local make_start=false
   for arg in "${ALL_ARGS[@]}"; do
-    if [[ "$arg" == "--make" ]]
-    then
+    if [[ "$arg" == "--make" ]]; then
       make_start=true
-    elif [[ $make_start == false ]]
-    then
+    elif [[ "$make_start" == false ]]; then
       BUILD_ARGS+=("$arg")
     else
       MAKE_ARGS+=("$arg")
     fi
-
   done
 }
 
-# try call command make, if use give --make in command line.
 function try_make
 {
-  # use single thread `make` if concurrent building failed
   make "${MAKE_ARGS[@]}" || make
 }
 
-# create build directory and cd it.
 function prepare_build_dir
 {
-  TYPE=$1
-  mkdir -p $TOPDIR/build_$TYPE && cd $TOPDIR/build_$TYPE
+  rm -rf "${TOPDIR}/build"
+  mkdir -p "${TOPDIR}/build"
+  cd "${TOPDIR}/build"
+}
+
+# Parse -j from MAKE_ARGS; default 4
+function get_jobs
+{
+  local jobs=4
+  for ((i=0; i<${#MAKE_ARGS[@]}; i++)); do
+    if [[ "${MAKE_ARGS[$i]}" == "-j" && $((i+1)) -lt ${#MAKE_ARGS[@]} ]]; then
+      jobs="${MAKE_ARGS[$((i+1))]}"
+    elif [[ "${MAKE_ARGS[$i]}" =~ ^-j[0-9]+$ ]]; then
+      jobs="${MAKE_ARGS[$i]#-j}"
+    fi
+  done
+  echo "${jobs}"
+}
+
+function cmake_build_install
+{
+  # Usage: cmake_build_install <src_dir> <build_dir> [cmake_args...]
+  local src_dir="$1"; shift
+  local build_dir="$1"; shift
+  local jobs
+  jobs="$(get_jobs)"
+
+  mkdir -p "${build_dir}"
+
+  # Configure
+  ${CMAKE_CONFIGURE} -S "${src_dir}" -B "${build_dir}" \
+    -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}" \
+    "$@"
+
+  # Build (use cmake binary only; do NOT include -D/--log-level here)
+  ${CMAKE_BIN} --build "${build_dir}" --parallel "${jobs}"
+
+  # Install
+  ${CMAKE_BIN} --install "${build_dir}"
 }
 
 function do_init
 {
-  git submodule update --init || return
-  current_dir=$PWD
+  git submodule update --init --recursive
 
-  MAKE_COMMAND="make --silent"
+  # libevent
+  (
+    cd "${TOPDIR}/deps/3rd/libevent"
+    git checkout release-2.1.12-stable
+  )
+  cmake_build_install "${TOPDIR}/deps/3rd/libevent" "${TOPDIR}/deps/3rd/libevent/build" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DEVENT__DISABLE_OPENSSL=ON \
+    -DEVENT__LIBRARY_TYPE=BOTH
 
-  # build libevent
-  cd ${TOPDIR}/deps/3rd/libevent && \
-    git checkout release-2.1.12-stable && \
-    mkdir -p build && \
-    cd build && \
-    ${CMAKE_COMMAND} .. -DEVENT__DISABLE_OPENSSL=ON -DEVENT__LIBRARY_TYPE=BOTH && \
-    ${MAKE_COMMAND} -j4 && \
-    make install
+  # googletest
+  cmake_build_install "${TOPDIR}/deps/3rd/googletest" "${TOPDIR}/deps/3rd/googletest/build"
 
-  # build googletest
-  cd ${TOPDIR}/deps/3rd/googletest && \
-    mkdir -p build && \
-    cd build && \
-    ${CMAKE_COMMAND} .. && \
-    ${MAKE_COMMAND} -j4 && \
-    ${MAKE_COMMAND} install
+  # benchmark
+  cmake_build_install "${TOPDIR}/deps/3rd/benchmark" "${TOPDIR}/deps/3rd/benchmark/build" \
+    -DBENCHMARK_ENABLE_TESTING=OFF \
+    -DBENCHMARK_INSTALL_DOCS=OFF \
+    -DBENCHMARK_ENABLE_GTEST_TESTS=OFF \
+    -DBENCHMARK_USE_BUNDLED_GTEST=OFF \
+    -DBENCHMARK_ENABLE_ASSEMBLY_TESTS=OFF
 
-  # build google benchmark
-  cd ${TOPDIR}/deps/3rd/benchmark && \
-    mkdir -p build && \
-    cd build && \
-    ${CMAKE_COMMAND} .. -DBENCHMARK_ENABLE_TESTING=OFF  -DBENCHMARK_INSTALL_DOCS=OFF -DBENCHMARK_ENABLE_GTEST_TESTS=OFF -DBENCHMARK_USE_BUNDLED_GTEST=OFF -DBENCHMARK_ENABLE_ASSEMBLY_TESTS=OFF && \
-    ${MAKE_COMMAND} -j4 && \
-    ${MAKE_COMMAND} install
+  # jsoncpp
+  cmake_build_install "${TOPDIR}/deps/3rd/jsoncpp" "${TOPDIR}/deps/3rd/jsoncpp/build" \
+    -DJSONCPP_WITH_TESTS=OFF \
+    -DJSONCPP_WITH_POST_BUILD_UNITTEST=OFF
 
-  # build jsoncpp
-  cd ${TOPDIR}/deps/3rd/jsoncpp && \
-    mkdir -p build && \
-    cd build && \
-    ${CMAKE_COMMAND} -DJSONCPP_WITH_TESTS=OFF -DJSONCPP_WITH_POST_BUILD_UNITTEST=OFF .. && \
-    ${MAKE_COMMAND} && \
-    ${MAKE_COMMAND} install
-
-  cd $current_dir
-}
-
-function prepare_build_dir
-{
-  rm -f build
-  mkdir -p ${TOPDIR}/build
-  cd ${TOPDIR}/build
+  echo ""
+  echo "[OK] Dependencies installed to: ${DEPS_PREFIX}"
+  echo "     include: ${DEPS_PREFIX}/include"
+  echo "     lib:     ${DEPS_PREFIX}/lib"
+  echo ""
 }
 
 function do_build
 {
-  TYPE=$1; shift
-  prepare_build_dir || return
-  echo "${CMAKE_COMMAND} ${TOPDIR} $@"
-  ${CMAKE_COMMAND} -S ${TOPDIR} $@
-  cp ${TOPDIR}/test/data.txt ${TOPDIR}/build/bin/
+  local TYPE="$1"; shift
+  prepare_build_dir
+
+  export PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+  echo "${CMAKE_CONFIGURE} -S ${TOPDIR} -B ${TOPDIR}/build $*"
+  ${CMAKE_CONFIGURE} -S "${TOPDIR}" -B "${TOPDIR}/build" \
+    -DCMAKE_PREFIX_PATH="${DEPS_PREFIX}" \
+    "$@"
+
+  mkdir -p "${TOPDIR}/build/bin"
+  cp -f "${TOPDIR}/test/data.txt" "${TOPDIR}/build/bin/" || true
 }
 
 function do_clean
 {
-  echo "clean build_* dirs"
-  find . -maxdepth 1 -type d -name 'build_*' | xargs rm -rf
+  echo "clean build dir and dependency build dirs"
+  rm -rf "${TOPDIR}/build"
+  rm -rf "${TOPDIR}/deps/3rd/libevent/build" \
+         "${TOPDIR}/deps/3rd/googletest/build" \
+         "${TOPDIR}/deps/3rd/benchmark/build" \
+         "${TOPDIR}/deps/3rd/jsoncpp/build"
 }
 
 function build
 {
-  set -- "${BUILD_ARGS[@]}"
-  case "x$1" in
+  set -- "${BUILD_ARGS[@]:-}"
+  case "x${1:-}" in
     xrelease)
-      do_build "$@" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDEBUG=OFF
+      shift || true
+      do_build release -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDEBUG=OFF "$@"
       ;;
-    xdebug)
-      do_build "$@" -DCMAKE_BUILD_TYPE=Debug -DDEBUG=ON
+    xdebug|"x")
+      if [[ "x${1:-}" == "xdebug" ]]; then shift || true; fi
+      do_build debug -DCMAKE_BUILD_TYPE=Debug -DDEBUG=ON "$@"
       ;;
     *)
       BUILD_ARGS=(debug "${BUILD_ARGS[@]}")
@@ -149,8 +181,8 @@ function build
 
 function main
 {
-  case "$1" in
-    -h)
+  case "${1:-}" in
+    -h|--help)
       usage
       ;;
     init)
